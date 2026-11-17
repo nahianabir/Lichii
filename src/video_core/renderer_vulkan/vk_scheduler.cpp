@@ -10,6 +10,7 @@
 #include <vector>
 #include <string_view>
 #include <string>
+#include <tuple>
 #include <map>
 #include <mutex>
 #include <thread>
@@ -32,6 +33,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
+#include "video_core/renderer_vulkan/present/frame_gen_trace.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -133,7 +135,7 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
                 .pipelineStatistics = 0,
             });
             trace_submissions.resize(TraceMaxSubmissions);
-            if (Common::DkbFrameTrace::Enabled()) {
+            if (Common::DkbFrameTrace::Enabled() || FrameGenTrace::Enabled()) {
                 trace_work_pool = device.GetLogical().CreateQueryPool({
                     .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
                     .pNext = nullptr,
@@ -143,6 +145,8 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
                     .pipelineStatistics = 0,
                 });
                 trace_work_items.resize(TraceMaxWork);
+            }
+            if (Common::DkbFrameTrace::Enabled()) {
                 trace_site_pool = device.GetLogical().CreateQueryPool({
                     .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
                     .pNext = nullptr,
@@ -164,10 +168,11 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
                 trace_pass_tails.resize(TraceMaxSubmissions);
             }
         } catch (const vk::Exception& error) {
-            LOG_WARNING(Render_Vulkan, "DKB gpu_timestamp unavailable: {}", error.what());
+            LOG_WARNING(Render_Vulkan, "Vulkan GPU timestamp queries unavailable: {}",
+                        error.what());
         }
-    } else if (Common::DkbFrameTrace::Enabled()) {
-        LOG_INFO(Render_Vulkan, "DKB gpu_timestamp unsupported: valid_bits={} period_ns={}",
+    } else if (Common::DkbFrameTrace::Enabled() || FrameGenTrace::Enabled()) {
+        LOG_INFO(Render_Vulkan, "Vulkan GPU timestamp queries unsupported: valid_bits={} period_ns={}",
                  trace_timestamp_bits, trace_timestamp_period);
     }
 
@@ -848,8 +853,11 @@ void Scheduler::ReportWorkTimes() {
         u32 count{};
         std::array<u32, 3> max_size{};
     };
-    std::map<std::pair<u64, u64>, Totals> by_shaders;
+    std::map<std::tuple<u64, u64, std::string_view>, Totals> by_shaders;
     double total_ms{};
+    double history_copy_ms{};
+    double flow_ms{};
+    double interpolation_ms{};
     for (u32 i = 0; i < count; ++i) {
         if (results[i * 2].available == 0 || results[i * 2 + 1].available == 0) {
             continue;
@@ -859,7 +867,7 @@ void Scheduler::ReportWorkTimes() {
                               trace_timestamp_bits)) *
                           trace_timestamp_period / 1e6;
         const WorkTrace& item = trace_work_items[i];
-        Totals& totals = by_shaders[{item.hash, item.fragment_hash}];
+        Totals& totals = by_shaders[{item.hash, item.fragment_hash, item.label}];
         totals.total_ms += ms;
         ++totals.count;
         if (ms > totals.max_ms) {
@@ -867,9 +875,16 @@ void Scheduler::ReportWorkTimes() {
             totals.max_size = item.size;
         }
         total_ms += ms;
+        if (item.label == "fsr3-history-copy") {
+            history_copy_ms += ms;
+        } else if (item.label == "fsr3-optical-flow") {
+            flow_ms += ms;
+        } else if (item.label == "fsr3-interpolation") {
+            interpolation_ms += ms;
+        }
     }
-    std::vector<std::pair<std::pair<u64, u64>, Totals>> sorted(by_shaders.begin(),
-                                                               by_shaders.end());
+    std::vector<std::pair<std::tuple<u64, u64, std::string_view>, Totals>> sorted(
+        by_shaders.begin(), by_shaders.end());
     std::ranges::sort(sorted, std::greater<>{},
                       [](const auto& entry) { return entry.second.total_ms; });
     if (sorted.size() > 8) {
@@ -877,17 +892,26 @@ void Scheduler::ReportWorkTimes() {
     }
     std::string slowest;
     for (const auto& [shaders, totals] : sorted) {
-        const auto& [hash, fragment_hash] = shaders;
-        slowest += fragment_hash == 0
-                       ? fmt::format(" s6:{:016x}", hash)
-                       : fmt::format(" s1:{:016x}+s5:{:016x}", hash, fragment_hash);
+        const auto& [hash, fragment_hash, label] = shaders;
+        if (!label.empty()) {
+            slowest += fmt::format(" {}", label);
+        } else {
+            slowest += fragment_hash == 0
+                           ? fmt::format(" s6:{:016x}", hash)
+                           : fmt::format(" s1:{:016x}+s5:{:016x}", hash, fragment_hash);
+        }
         slowest += fmt::format("={:.3f}ms/{}x(max {:.3f}ms size {}x{}x{})", totals.total_ms,
                                totals.count, totals.max_ms, totals.max_size[0],
                                totals.max_size[1], totals.max_size[2]);
     }
-    LOG_INFO(Render_Vulkan,
-             "DKB gpu_work renderer_frame={} timed={} timed_sum_ms={:.3f} slowest:{}",
-             trace_sample_frame, count, total_ms, slowest);
+    if (Common::DkbFrameTrace::Enabled()) {
+        LOG_INFO(Render_Vulkan,
+                 "DKB gpu_work renderer_frame={} timed={} timed_sum_ms={:.3f} slowest:{}",
+                 trace_sample_frame, count, total_ms, slowest);
+    }
+    if (history_copy_ms != 0.0 || flow_ms != 0.0 || interpolation_ms != 0.0) {
+        FrameGenTrace::GpuWork(history_copy_ms, flow_ms, interpolation_ms);
+    }
 }
 
 void Scheduler::RecordSiteMarker(std::source_location location) {

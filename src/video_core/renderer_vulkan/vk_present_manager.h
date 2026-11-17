@@ -50,6 +50,9 @@ struct Frame {
     std::chrono::nanoseconds present_spacing{};
     /// The presents that show this frame's game frame: 1 plus the frames generated for it.
     u32 game_frame_presents{1};
+    bool frame_gen_trace_valid{};
+    u64 frame_gen_trace_id{};
+    u32 frame_gen_trace_ordinal{};
 #ifdef EGLANTINE_STREAMLINE
     // DLSS Frame Generation: the guest frame presented and where the guest image is in the frame.
     bool frame_gen{};
@@ -110,9 +113,9 @@ private:
 
     void PresentThread(std::stop_token token);
 
-    void CopyToSwapchain(Frame* frame);
+    bool CopyToSwapchain(Frame* frame);
 
-    void CopyToSwapchainImpl(Frame* frame);
+    bool CopyToSwapchainImpl(Frame* frame);
 
     // Returns false after discarding the frame if creation or transfer cannot proceed.
     bool RecreateSwapchain(Frame* frame);
@@ -129,7 +132,9 @@ private:
 
     /// With EDEN_DKB_FRAME_TRACE=1 and frame generation on, logs the presents of every 10 s.
     void LogPacing(const Frame* frame, std::chrono::steady_clock::duration took,
-                   std::chrono::steady_clock::time_point now);
+                   std::chrono::steady_clock::time_point ready,
+                   std::chrono::steady_clock::time_point due,
+                   std::chrono::steady_clock::time_point now, bool succeeded);
 
 private:
     const vk::Instance& instance;
@@ -163,6 +168,7 @@ private:
         std::chrono::steady_clock::time_point since{};
         u64 real{};
         u64 generated{};
+        u64 dropped{};
         std::chrono::nanoseconds spacing{};
         std::chrono::steady_clock::duration present_time{};
     } pacing_log;

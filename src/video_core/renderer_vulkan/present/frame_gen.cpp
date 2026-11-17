@@ -17,6 +17,7 @@
 #include "common/settings.h"
 #include "video_core/frame_gen_choice.h"
 #include "video_core/renderer_vulkan/present/frame_gen.h"
+#include "video_core/renderer_vulkan/present/frame_gen_trace.h"
 #include "video_core/renderer_vulkan/present/util.h"
 #include "video_core/renderer_vulkan/vk_present_manager.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -301,6 +302,9 @@ FrameGen::~FrameGen() = default;
 
 void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
                        VkExtent2D guest_extent) {
+    const bool trace_enabled = FrameGenTrace::Enabled();
+    const auto process_started = trace_enabled ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
     generated = false;
 
     const Settings::FrameGenType chosen = Settings::values.frame_gen_type.GetValue();
@@ -308,6 +312,7 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
         chosen == Settings::FrameGenType::NvidiaDlssG
             ? VideoCore::ActiveFrameGenType(chosen, DlssgBlocked())
             : chosen;
+    frame->frame_gen_trace_valid = false;
     if (type == Settings::FrameGenType::Lsfg && !shaders) {
         shaders.emplace(device);
     }
@@ -339,6 +344,9 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
         warm_streak = 0;
         return;
     }
+    frame->frame_gen_trace_valid = FrameGenTrace::Enabled() &&
+                                   (type == Settings::FrameGenType::Fsr3 ||
+                                    type == Settings::FrameGenType::XeFG);
 
     if (type == Settings::FrameGenType::XeFG) {
         const auto now = std::chrono::steady_clock::now();
@@ -370,6 +378,11 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
     const u64 count = frame_count++;
     last_count = count;
     last_generations = plan.generations;
+    frame->frame_gen_trace_id = count;
+    frame->frame_gen_trace_ordinal = 0;
+    if (frame->frame_gen_trace_valid && count % 60 == 0) {
+        scheduler.RequestGpuBusySample();
+    }
 
     const bool warm = plan.warm && count + 1 >= LSFG_REQUIRED_FRAMES;
     warm_streak = warm ? warm_streak + 1 : 0;
@@ -424,6 +437,11 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
             DumpDebugImages(count);
         }
         dumped = true;
+    }
+    if (frame->frame_gen_trace_valid) {
+        FrameGenTrace::RealFrame(
+            count, std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - process_started).count());
     }
 }
 
@@ -512,6 +530,7 @@ void FrameGen::LogActivity() {
 
 size_t FrameGen::WantedGenerations(size_t capacity, size_t free_frames,
                                    std::chrono::steady_clock::duration blocked) {
+    FrameGenTrace::QueueState(capacity, free_frames, blocked);
     if (unavailable) {
         plan = {};
         return 0;
@@ -529,6 +548,14 @@ size_t FrameGen::GeneratedFrameCount() const {
 }
 
 void FrameGen::GenerateInto(const Device& device, Frame* destination, size_t generation) {
+    const bool trace_enabled = FrameGenTrace::Enabled();
+    const auto record_started = trace_enabled ? std::chrono::steady_clock::now()
+                                              : std::chrono::steady_clock::time_point{};
+    destination->frame_gen_trace_valid = FrameGenTrace::Enabled() &&
+                                        (built_type == Settings::FrameGenType::Fsr3 ||
+                                         built_type == Settings::FrameGenType::XeFG);
+    destination->frame_gen_trace_id = last_count;
+    destination->frame_gen_trace_ordinal = static_cast<u32>(generation + 1);
     const bool use_fsr3 = built_type == Settings::FrameGenType::Fsr3 ||
                           built_type == Settings::FrameGenType::XeFG;
 
@@ -552,6 +579,12 @@ void FrameGen::GenerateInto(const Device& device, Frame* destination, size_t gen
             chain->DispatchGeneration(cmdbuf, count, generation_count, generation, target, image,
                                       extent);
         });
+    }
+    if (destination->frame_gen_trace_valid) {
+        FrameGenTrace::GeneratedFrame(
+            last_count, destination->frame_gen_trace_ordinal,
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - record_started).count());
     }
 }
 

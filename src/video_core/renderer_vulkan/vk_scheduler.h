@@ -19,6 +19,7 @@
 #include <queue>
 #include <source_location>
 #include <span>
+#include <string_view>
 #include <vector>
 
 #include "common/alignment.h"
@@ -106,13 +107,14 @@ public:
     /// submission. A draw passes its vertex and fragment hashes, a dispatch its compute hash.
     template <typename Func>
     void TraceGpuWork(vk::CommandBuffer cmdbuf, u64 hash, u64 fragment_hash,
-                      std::array<u32, 3> size, Func&& work) {
-        if (!trace_gpu_recording || !trace_work_pool || trace_work_count == TraceMaxWork) {
+                      std::array<u32, 3> size, Func&& work, std::string_view label = {}) {
+        if (!trace_gpu_recording || !trace_work_pool || trace_work_count == TraceMaxWork ||
+            (!Common::DkbFrameTrace::Enabled() && label.empty())) {
             work();
             return;
         }
         const u32 query = trace_work_count * 2;
-        trace_work_items[trace_work_count++] = {hash, fragment_hash, size};
+        trace_work_items[trace_work_count++] = {hash, fragment_hash, size, label};
         cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *trace_work_pool, query);
         work();
         cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *trace_work_pool, query + 1);
@@ -547,6 +549,7 @@ private:
         u64 fragment_hash{};
         /// Dispatch grid, or vertex and instance counts of a draw; zero when indirect.
         std::array<u32, 3> size{};
+        std::string_view label;
     };
     vk::QueryPool trace_work_pool;
     std::vector<WorkTrace> trace_work_items;

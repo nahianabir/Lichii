@@ -58,7 +58,7 @@ public:
     bool AcquireNextImage(bool may_flush = true, u32 game_frame_presents = 1);
 
     /// Presents the rendered image to the swapchain.
-    void Present(VkSemaphore render_semaphore);
+    [[nodiscard]] bool Present(VkSemaphore render_semaphore);
 
     /// Returns true when the swapchain needs to be recreated.
     bool NeedsRecreation() const {

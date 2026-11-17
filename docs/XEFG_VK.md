@@ -6,7 +6,7 @@ XeFG-VK is an experimental, presentation-only frame-generation research project.
 
 | Stage | Status |
 | --- | --- |
-| MVP 1: compositor color capture | Implemented as queued GPU copies; not compiled or executed in Lichii yet |
+| Separate XeFG color capture | Helper remains in source but is removed from the active renderer path; no duplicate color-history copies are made |
 | Vulkan device capability query | A750 driver queried with `vulkaninfo`; cooperative-matrix extension and feature exposed |
 | Matrix shape query | Not verified on this machine; `vulkaninfo` did not print the shape list |
 | XMX instruction execution | Not verified |
@@ -26,18 +26,15 @@ flowchart TD
     D --> E[Layer composition and display post-processing]
     A --> E
     E --> F[Final Vulkan presentation image]
-    F --> G[MVP 1: two-image color history capture]
-    G --> H[PresentManager queue and swapchain]
-    F --> I[XeFG 2x optical-flow MVP]
+    F --> I[Built-in FSR3 / XeFG optical-flow path]
     I --> J[Half-resolution flow and compute interpolation]
     J --> K[Generated intermediate frame]
+    F --> H[PresentManager queue and swapchain]
     K --> H
     J -. future .-> L[Replaceable XMX inference backend]
 ```
 
-MVP 1 is inserted in `RendererVulkan::Composite`, immediately after `BlitScreen::DrawToFrame`. It copies the final `Frame::image` into a two-slot Vulkan image ring using the existing `Scheduler` command stream. The copy transitions the source from `GENERAL` to `TRANSFER_SRC_OPTIMAL`, copies into a history image, then restores both images to `GENERAL`. The copy is ordered before the existing `render_ready` semaphore is signaled and before `PresentManager` reads the frame. It does not read pixels back to the CPU, submit work on a second queue, or wait for generation.
-
-Set `EDEN_XEFG_CAPTURE=1` before launching Lichii to enable this diagnostic capture. The default is off. Logs say “queued” deliberately: the current implementation does not wait for or verify GPU completion. On a render-size or format change, the scheduler is finished before history images are replaced; this is a rare, potentially blocking reconfiguration path.
+`XeFGVKCapture` is no longer constructed or called from `RendererVulkan::Composite`. Its source files remain in the tree, but `EDEN_XEFG_CAPTURE` has no runtime effect. The active renderer uses only the history images owned by `Fsr3FrameGen`.
 
 The UI now offers `XeFG (Optical Flow, 2x)`. This mode uses the existing `Fsr3FrameGen` GPU optical-flow and interpolation implementation and the existing bounded presentation queue, capped at one generated frame per real frame. It is an MVP algorithm, not a neural model and not XMX inference. Inference is explicitly reported unavailable. When the existing flow-dump debug option is enabled, XeFG writes a one-shot, colorized half-resolution motion-vector image to the user data `lossless/debug` directory. That debug readback waits for the GPU and should not be used for performance measurements.
 
@@ -50,7 +47,7 @@ The generic Vulkan path is:
 3. `Scheduler::Flush(*frame->render_ready)` submits the recorded rendering work and signals the frame-ready semaphore.
 4. `PresentManager` copies or blits the frame to the swapchain and presents it. Its frame pool uses `render_ready`, `present_done`, and the scheduler's GPU timeline for resource and queue lifetime.
 
-The presentation image already has transfer-source usage and ends the render pass in `GENERAL`. The final composition includes all layers that were supplied to the compositor; this capture point cannot distinguish game imagery from HUD, menus, or other overlays. Interpolating it would therefore interpolate UI too.
+The presentation image already has transfer-source usage and ends the render pass in `GENERAL`. The final composition includes all layers supplied to the compositor, including HUD and menus. The dormant XeFG color-capture helper is not used by the active pipeline.
 
 The personal XeSS-SR integration remains intact and is game-specific to Ocarina of Time:
 
@@ -65,17 +62,43 @@ The exact XeSS runtime and its model are not used by XeFG-VK. No XeSS-SR source 
 
 | Input | Current availability |
 | --- | --- |
-| Current color | Available at the generic final compositor; captured by MVP 1 |
-| Previous color | Available in the MVP 1 two-slot image history after two capture records |
+| Current color | Available at the final compositor and passed directly to `Fsr3FrameGen::Process` |
+| Previous color | Stored in `Fsr3FrameGen`'s current/history images; no second capture ring is active |
 | Depth | Available in the Ocarina-specific scene/upscaler path; not exposed by the generic compositor |
 | Motion vectors | XeFG estimates image-space motion from consecutive final-compositor colors; Ocarina also has reconstructed camera/actor motion, not currently wired into generic XeFG |
 | Camera/object transforms | Available only through game-specific Ocarina hooks used by its motion pass |
-| Frame timing | Host presentation and scheduler timing exist; no XeFG timing metrics are implemented |
+| Frame timing | `EDEN_FSR3_FG_TRACE=1` reports host event timestamps and scheduler GPU timestamps for instrumented FSR3 work |
 | Render/output resolution | Present in Ocarina upscaler inputs and in the presentation `Frame` dimensions |
 
-The eventual motion-provider interface should allow the Ocarina reconstructed vectors, other game-specific providers, and image-space optical flow to be selected independently. The current XeFG mode uses image-space optical flow only and resets its history after host frame gaps over 250 ms. Scene-cut, menu, loading, and camera-discontinuity detection is not implemented yet.
+The current XeFG mode uses the existing image-space optical flow and resets its history after host frame gaps over 250 ms. Scene-cut, menu, loading, and camera-discontinuity detection is not implemented yet.
 
-For Ocarina, the lower-resolution scene inputs preserve depth and reconstructed motion and reduce the pixel count for optical flow or inference. Generating before XeSS would require a compatible upscale of the generated image and careful management of XeSS's temporal history. Generating after XeSS reduces dependence on the lower-resolution input path and has a sharp output image, but costs more pixels and receives already-upscaled content. The current final-compositor capture is later still: it includes UI and has no matching depth/motion. The correct production insertion point is therefore not selected; a game-scene insertion before UI composition is the preferred direction if its resources and synchronization can be exposed safely.
+For Ocarina, the lower-resolution scene inputs preserve depth and reconstructed motion and reduce the pixel count for optical flow or inference. Generating before XeSS would require a compatible upscale of the generated image and careful management of XeSS's temporal history. Generating after XeSS reduces dependence on the lower-resolution input path and has a sharp output image, but costs more pixels and receives already-upscaled content. The active FSR3 path instead receives final-compositor color, so its optical flow also sees UI and overlays and has no depth input. Ocarina's reconstructed depth/motion is game-specific and is not wired into this general FG path; a better insertion point is not selected.
+
+## XMX Backend Research
+## Source-Level Baseline and Bottlenecks
+
+These are source-derived workload characteristics, not measured performance results:
+
+- For an output extent `W x H`, flow resources are `max(1,W/2) x max(1,H/2)`, so the flow dispatch covers roughly one quarter of output pixels in 16x16 workgroups.
+- After initialization, every real frame copies the prior current image to history and the new compositor frame to current. Each generated output then runs a full-resolution interpolation dispatch.
+- The flow shader compares one current luma sample against a fixed four-point radius-2 diamond and a four-point radius-1 refinement. At half resolution, this search is limited to about six output pixels per component for even extents; motion beyond that window is likely to mismatch.
+- `search_radius` and `block_size` are pushed to the flow shader but not read there. `flow_scale` is pushed to the interpolation shader but not read there. Verify these candidate configuration issues with controlled scenes and traces before changing behavior.
+- Flow matching is single-channel luma with a per-sample absolute difference and distance penalty; it has no confidence or forward/backward consistency test. Interpolation uses componentwise median motion and RGB difference for occlusion, with no depth/disocclusion input. These choices can produce mismatches on flat/repeating textures, edge bleeding, and ghosting at disocclusions.
+- The trace can measure history-copy and dispatch GPU intervals, but no A750 measurements, visual A/Bs, FPS deltas, or performance baseline have been collected.
+
+## Proposed Experiments
+
+Ranked by expected value and risk; benchmark each change independently before retaining it.
+
+| Rank | Candidate | Expected benefit | Risk |
+| --- | --- | --- | --- |
+| 1 | Collect baseline traces and scene captures on the A750 | Identifies whether copies, flow, interpolation, or pacing dominate | Low; diagnostics add overhead, so final FPS runs must disable tracing |
+| 2 | Reduce history-copy traffic with same-scheduler ping-pong images and descriptor sets safe for in-flight use | Potentially large bandwidth reduction | Medium/high; descriptor/resource lifetime changes can race queued work |
+| 3 | Test a wider or coarse-to-fine search against fast-motion captures | Better motion coverage and fewer large-motion mismatches | High; more samples/levels can raise GPU cost and introduce false matches |
+| 4 | Add motion confidence and forward/backward occlusion rejection | Fewer ghosts and disocclusion leaks | Medium/high; requires a robust GPU flow representation and quality corpus |
+| 5 | A/B workgroup size, shared-memory usage, and image formats on Intel Arc | Possible occupancy/cache improvement | Medium; benefit is driver/GPU-specific and currently unknown |
+
+No shader algorithm or workgroup changes are made in this instrumentation stage.
 
 ## XMX Backend Research
 
@@ -122,30 +145,31 @@ No external source code or model was copied into the MVP. The existing user-prov
 
 ## Synchronization and Pacing
 
-MVP 1 uses the renderer's graphics queue and scheduler. It appends image barriers and a copy after frame composition; the regular frame submission signals `Frame::render_ready`, which the present path waits on. The XeFG 2x path uses `Fsr3FrameGen` on the same scheduler, then Lichii's bounded frame pool and present thread pace the generated frame. No emulated CPU/GPU timing, input polling, game logic, or audio timing is changed.
+FSR3 history copies, optical flow, and interpolation are recorded on the existing scheduler. Generated images use normal presentation frames; the present thread waits for `render_ready` and the frame is not recycled until its present fence signals. `FrameGenPacer`, bounded frame availability, and present spacing remain the pacing controls. No emulated CPU/GPU timing, input polling, game logic, or audio timing is changed.
 
-Lichii already has an asynchronous present thread and bounded presentation-frame pool, and its optional FSR3 frame-generation path already spaces generated frames. Those mechanisms are references for future pacing, not evidence that XeFG scheduling is implemented. A future XeFG path must avoid unbounded queued frames and must not wait on the CPU for inference in the normal frame loop.
+The `XeFG (Optical Flow, 2x)` selector currently routes through the existing `Fsr3FrameGen` implementation and caps generation to one intermediate per real frame. It does not create another present thread or queue. Any future backend should continue using that path and avoid unbounded queued frames or CPU waits for inference.
 
 ## Build and Runtime
 
-MVP 1 adds no SDK or third-party dependency. Build using the repository's existing Windows Vulkan/CMake environment, for example:
+The built-in optical-flow path adds no SDK or third-party dependency. Build using the repository's existing Windows Vulkan/CMake environment, for example:
 
 ```powershell
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 ```
 
-The `XeFG (Optical Flow, 2x)` frame-generation type is selected in Lichii's existing frame-generation settings; enable frame generation and choose this type. `EDEN_XEFG_CAPTURE=1` independently enables the MVP 1 diagnostic capture and is off by default. The existing flow-dump option writes a motion visualization for XeFG. No XMX/Level Zero runtime DLL dependency has been added.
+The `XeFG (Optical Flow, 2x)` frame-generation type is selected in Lichii's existing frame-generation settings; enable frame generation and choose this type. Set `EDEN_FSR3_FG_TRACE=1` before launch for one-second FG summaries and per-event timestamps. This records CPU process/record wall time separately from Vulkan GPU timestamps. GPU counters cover only the labeled history-copy, flow-dispatch, and interpolation-dispatch scopes, not all FG barriers or the whole frame. Present timestamps are host times when `vkQueuePresentKHR` returns, not display scanout times. The trace's delay count is readiness later than the present-thread due time, and repeated-image detection is unavailable. The existing flow-dump option writes a motion visualization for XeFG; that debug readback is blocking and must be disabled for performance runs. No XMX/Level Zero runtime DLL dependency has been added.
 
 ## Validation and Measurements
 
 - Repository: feature work is on `feature/xmx-xefg-vk`, based at the XeSS branch commit shown above. The XeSS branch itself is unchanged.
-- Source diagnostics: VS Code reported no errors in the new capture source or the touched renderer files.
+- Source diagnostics: VS Code reported no errors in the trace, scheduler, present-manager, swapchain, and renderer files. `frame_gen.cpp` and `fsr3_frame_gen.cpp` could not be fully parsed because this workspace has no configured C++/Vulkan include paths or generated shader headers.
 - Patch hygiene: `git diff --check` passed.
-- Build: not run. No configured build tree, CMake, or Ninja was available in this environment.
+- Build/tests: not run. No compiler, CMake, Ninja, or configured build tree is available in this environment.
 - Vulkan runtime: `vulkaninfo` identified the Intel Arc A750 and reported the cooperative-matrix extension/feature, Win32 external memory, and timeline semaphore. It did not expose cooperative-matrix shape details. XeFG now logs the shape list when selected, but that code has not been run.
-- Capture and interpolation execution: not run. The installed Lichii binary predates these source edits; queued GPU copies and generated frames have not been verified in a rendered session.
-- XMX execution, image quality, frame pacing, latency, VRAM, CPU overhead, and GPU timing: not measured.
+- Built-in FG interpolation execution: not run on this branch.
+- Baseline/after FPS, GPU time, frame quality, latency, VRAM, CPU overhead, and XMX execution: not measured. No improvement is claimed.
+- `EDEN_FSR3_FG_TRACE=1` records real inputs, generated-frame records, successful/suboptimal presents, drops, readiness lateness, frame-pool waits, CPU process/record wall time, and scheduler GPU timestamp scopes for FSR3 history copies and compute dispatches. GPU figures are the sum of those named scopes, not whole-frame GPU time. Repeated-image detection is unavailable.
 
 ## Test Plan
 
@@ -153,15 +177,15 @@ Before enabling generated frames, validate the capture and capability paths sepa
 
 - **Hardware:** Intel Arc A750 on Windows; a non-Intel Vulkan GPU; and an Intel GPU/driver without a usable matrix path to verify graceful feature disablement.
 - **Vulkan:** enumerate cooperative-matrix extension and feature support, list every reported matrix shape/type/scope, check the exact compute queue and image-format usages, query timeline semaphores, and check external-memory/semaphore capabilities only for an interop experiment.
-- **Capture:** static scene, moving camera, moving objects, resize, format/HDR changes, dropped/hidden frames, and image reuse under Vulkan validation.
+- **Frame generation:** static scene, moving camera, moving objects, resize, format/HDR changes, dropped/hidden frames, and history reuse under Vulkan validation.
 - **Temporal transitions:** particles/transparency, HUD, menus, cutscenes, loading transitions, camera cuts/teleports, and variable frame intervals. Verify history reset and that the game simulation/input/audio timing remains unchanged.
-- **Performance:** record native and displayed FPS, frame time, motion time, inference time, GPU time, queue/present latency, VRAM, CPU overhead, and dropped/late generated frames. Compare the same scene and driver with capture/frame generation off and on.
+- **Performance:** use `EDEN_FSR3_FG_TRACE=1` to diagnose scoped work, then compare native and generated FPS, whole-frame GPU time, queue/present latency, VRAM, CPU overhead, and artifacts in the same scene/driver run with tracing off. The trace adds timestamp work and is not the final performance result. No before/after measurements have been collected yet.
 
 Known image artifacts cannot yet be assessed because there is no generated frame. Expected risks for a future interpolation algorithm include disocclusion holes, transparency/particle ghosting, camera-cut blends, and UI trails.
 
 ## Remaining Work
 
-1. Build the branch and run capture plus XeFG with Vulkan validation; verify image reuse, resize, reset, and present ordering.
+1. Build the branch and run the existing FSR3/XeFG mode with Vulkan validation; verify image reuse, resize, reset, and present ordering.
 2. Move XeFG input before UI composition and add a resource-provider contract for color, depth, motion, and reset metadata.
 3. Run XeFG on the A750 to capture exact cooperative-matrix shapes, then implement a standalone matrix inference dispatch and prove XMX/DPAS execution from compiler or vendor evidence.
 4. Evaluate quality across camera/object motion, particles, UI, menus, cutscenes, and loading transitions; add history-reset rules.

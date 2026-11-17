@@ -217,7 +217,6 @@ try
                   scheduler,
                   PresentFiltersForAppletCapture)
     , rasterizer(render_window, gpu, device_memory, device, memory_allocator, state_tracker, scheduler)
-    , xefg_capture(memory_allocator, scheduler)
 #ifdef HAS_LSFG
     , frame_gen(memory_allocator, scheduler)
 #endif
@@ -319,8 +318,6 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     blit_swapchain.DrawToFrame(device, rasterizer, frame, framebuffers,
                               render_window.GetFramebufferLayout(),
                               present_manager.SwapchainImageCount(), output_format.format, output);
-
-    xefg_capture.Capture(*frame->image, {frame->width, frame->height}, frame->image_format);
 
 #ifdef HAS_LSFG
     void(frame_gen.WantedGenerations(present_manager.MaxExtraFrames(),

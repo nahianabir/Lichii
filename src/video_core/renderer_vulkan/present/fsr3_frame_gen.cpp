@@ -4,6 +4,7 @@
 #include <algorithm>
 
 #include "video_core/renderer_vulkan/present/fsr3_frame_gen.h"
+#include "video_core/renderer_vulkan/present/frame_gen_trace.h"
 #include "video_core/renderer_vulkan/present/util.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -318,8 +319,14 @@ void Fsr3FrameGen::Process(const Device& device, Scheduler& scheduler, VkImage c
     }
     if (!m_has_history) {
         // First frame: populate history and current-frame copy via batched dual-copy
-        scheduler.Record([this, current_frame](vk::CommandBuffer cmdbuf) {
-            CopyImageToTwo(cmdbuf, current_frame, *m_history_image, *m_current_image, m_extent);
+        scheduler.Record([this, &scheduler, current_frame](vk::CommandBuffer cmdbuf) {
+            scheduler.TraceGpuWork(cmdbuf, 0, 0,
+                                   {m_extent.width, m_extent.height, 1},
+                                   [&] {
+                                       CopyImageToTwo(cmdbuf, current_frame, *m_history_image,
+                                                      *m_current_image, m_extent);
+                                   },
+                                   "fsr3-history-copy");
             DiscardForComputeWrite(cmdbuf, *m_motion_image);
         });
         m_has_history = true;
@@ -357,8 +364,10 @@ void Fsr3FrameGen::Process(const Device& device, Scheduler& scheduler, VkImage c
         device.GetLogical().UpdateDescriptorSets(updates, {});
         m_flow_descriptors_initialized = true;
     }
-
-    // Dispatch Optical Flow at half resolution
+            scheduler.TraceGpuWork(cmdbuf, 0, 0, {m_extent.width, m_extent.height, 1}, [&] {
+                CopyImageToImage(cmdbuf, *m_current_image, *m_history_image, m_extent);
+                CopyImageToImage(cmdbuf, current_frame, *m_current_image, m_extent);
+            }, "fsr3-history-copy");
     const u32 flow_w = m_flow_extent.width;
     const u32 flow_h = m_flow_extent.height;
     const FlowPushConstants constants{
@@ -370,7 +379,8 @@ void Fsr3FrameGen::Process(const Device& device, Scheduler& scheduler, VkImage c
         .block_size = 2.0f,
     };
 
-    scheduler.Record([this, constants, current_frame, flow_w, flow_h](vk::CommandBuffer cmdbuf) {
+    scheduler.Record([this, &scheduler, constants, current_frame, flow_w,
+                      flow_h](vk::CommandBuffer cmdbuf) {
         CopyImageToImage(cmdbuf, *m_current_image, *m_history_image, m_extent);
         CopyImageToImage(cmdbuf, current_frame, *m_current_image, m_extent);
 
@@ -381,11 +391,15 @@ void Fsr3FrameGen::Process(const Device& device, Scheduler& scheduler, VkImage c
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, {}, {}, barrier);
 
-        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *m_flow_pipeline);
-        cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *m_flow_pipe_layout, 0,
-                                  m_flow_desc_sets[0], {});
-        cmdbuf.PushConstants(*m_flow_pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, constants);
-        cmdbuf.Dispatch((flow_w + 15) / 16, (flow_h + 15) / 16, 1);
+        scheduler.TraceGpuWork(
+            cmdbuf, 0, 0, {(flow_w + 15) / 16, (flow_h + 15) / 16, 1}, [&] {
+                cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *m_flow_pipeline);
+                cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *m_flow_pipe_layout, 0,
+                                          m_flow_desc_sets[0], {});
+                cmdbuf.PushConstants(*m_flow_pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, constants);
+                cmdbuf.Dispatch((flow_w + 15) / 16, (flow_h + 15) / 16, 1);
+            },
+            "fsr3-optical-flow");
 
         BarrierComputeWriteToRead(cmdbuf, *m_motion_image);
     });
@@ -446,13 +460,18 @@ void Fsr3FrameGen::Generate(const Device& device, Scheduler& scheduler, VkImage 
         .flow_scale = flow_scale,
     };
 
-    scheduler.Record([this, constants, out_w, out_h, set, destination](vk::CommandBuffer cmdbuf) {
+    scheduler.Record([this, &scheduler, constants, out_w, out_h, set,
+                      destination](vk::CommandBuffer cmdbuf) {
         DiscardForComputeWrite(cmdbuf, destination);
-        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *m_interp_pipeline);
-        cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *m_interp_pipe_layout, 0,
-                                  set, {});
-        cmdbuf.PushConstants(*m_interp_pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, constants);
-        cmdbuf.Dispatch((out_w + 15) / 16, (out_h + 15) / 16, 1);
+        scheduler.TraceGpuWork(
+            cmdbuf, 0, 0, {(out_w + 15) / 16, (out_h + 15) / 16, 1}, [&] {
+                cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *m_interp_pipeline);
+                cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *m_interp_pipe_layout, 0,
+                                          set, {});
+                cmdbuf.PushConstants(*m_interp_pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, constants);
+                cmdbuf.Dispatch((out_w + 15) / 16, (out_h + 15) / 16, 1);
+            },
+            "fsr3-interpolation");
     });
 }
 

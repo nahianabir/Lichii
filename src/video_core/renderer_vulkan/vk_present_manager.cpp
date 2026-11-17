@@ -22,6 +22,7 @@
 #include "video_core/renderer_vulkan/vk_present_manager.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
+#include "video_core/renderer_vulkan/present/frame_gen_trace.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_surface.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -203,12 +204,29 @@ void PresentManager::StartPresentThread() {
 }
 
 void PresentManager::LogPacing(const Frame* frame, std::chrono::steady_clock::duration took,
-                               std::chrono::steady_clock::time_point now) {
+                               std::chrono::steady_clock::time_point ready,
+                               std::chrono::steady_clock::time_point due,
+                               std::chrono::steady_clock::time_point now, bool succeeded) {
+    const bool generated = frame->present_spacing.count() != 0;
+    const double ready_lateness_ms = due == std::chrono::steady_clock::time_point{}
+                                         ? 0.0
+                                         : std::max(0.0, std::chrono::duration<double, std::milli>(
+                                                             ready - due).count());
+    const double present_service_ms = std::max(
+        0.0, std::chrono::duration<double, std::milli>(now - (std::max)(ready, due)).count());
+    if (frame->frame_gen_trace_valid) {
+        FrameGenTrace::Presented(frame->frame_gen_trace_id, frame->frame_gen_trace_ordinal,
+                                 generated, succeeded, now, ready_lateness_ms,
+                                 present_service_ms);
+    }
     if (!Settings::values.frame_gen.GetValue()) {
         return;
     }
-    const bool generated = frame->present_spacing.count() != 0;
-    ++(generated ? pacing_log.generated : pacing_log.real);
+    if (succeeded) {
+        ++(generated ? pacing_log.generated : pacing_log.real);
+    } else {
+        ++pacing_log.dropped;
+    }
     pacing_log.spacing += frame->present_spacing;
     pacing_log.present_time += took;
     if (pacing_log.since == std::chrono::steady_clock::time_point{}) {
@@ -219,9 +237,9 @@ void PresentManager::LogPacing(const Frame* frame, std::chrono::steady_clock::du
         };
         const u64 total = pacing_log.real + pacing_log.generated;
         LOG_INFO(Render_Vulkan,
-                 "Frame gen pacing (10 s): {} real and {} generated presents, spacing {:.2f} ms "
-                 "after each generated frame, {:.2f} ms average wait and present",
-                 pacing_log.real, pacing_log.generated,
+                 "Frame gen pacing (10 s): {} real and {} generated presents, {} dropped, spacing "
+                 "{:.2f} ms after each generated frame, {:.2f} ms average wait and present",
+                 pacing_log.real, pacing_log.generated, pacing_log.dropped,
                  pacing_log.generated ? ms(pacing_log.spacing) / pacing_log.generated : 0.0,
                  total ? ms(pacing_log.present_time) / total : 0.0);
         pacing_log = {.since = now};
@@ -259,6 +277,9 @@ Frame* PresentManager::GetRenderFrame() {
     frame->color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     frame->present_spacing = {};
     frame->game_frame_presents = 1;
+    frame->frame_gen_trace_valid = false;
+    frame->frame_gen_trace_id = 0;
+    frame->frame_gen_trace_ordinal = 0;
 #ifdef EGLANTINE_STREAMLINE
     frame->frame_gen = false;
 #endif
@@ -283,7 +304,7 @@ void PresentManager::Present(Frame* frame) {
             VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::PresentWait};
             scheduler.WaitWorker();
         }
-        CopyToSwapchain(frame);
+        void(CopyToSwapchain(frame));
         free_queue.push_back(frame);
     }
 }
@@ -456,13 +477,14 @@ void PresentManager::PresentThread(std::stop_token token) {
             // again cost each generated frame an extra refresh, which lengthened the measured
             // frame interval and with it the spacing, until the game ran at a fraction of its
             // speed (#1772).
-            const auto start = (std::max)(next_present, ready);
+            const auto due = next_present;
+            const auto start = (std::max)(due, ready);
             SleepUntil(start);
-            CopyToSwapchain(frame);
+            const bool succeeded = CopyToSwapchain(frame);
             next_present = start + frame->present_spacing;
-            if (Common::DkbFrameTrace::Enabled()) {
+            if (Common::DkbFrameTrace::Enabled() || FrameGenTrace::Enabled()) {
                 const auto presented = std::chrono::steady_clock::now();
-                LogPacing(frame, presented - ready, presented);
+                LogPacing(frame, presented - ready, ready, due, presented, succeeded);
             }
 
             // Free the frame for reuse
@@ -556,7 +578,7 @@ void PresentManager::DiscardFrame(Frame* frame) {
     void(device.GetGraphicsQueue().Submit(submit_info, *frame->present_done));
 }
 
-void PresentManager::CopyToSwapchain(Frame* frame) {
+bool PresentManager::CopyToSwapchain(Frame* frame) {
 #ifdef EGLANTINE_STREAMLINE
     SCOPE_EXIT {
         if (frame->frame_gen) {
@@ -574,7 +596,7 @@ void PresentManager::CopyToSwapchain(Frame* frame) {
                 surface = CreateSurface(instance, render_window.GetWindowInfo());
 #endif
                 if (!RecreateSwapchain(frame)) {
-                    return;
+                    return false;
                 }
             }
 
@@ -592,9 +614,10 @@ void PresentManager::CopyToSwapchain(Frame* frame) {
     }
 
     DiscardFrame(frame);
+    return false;
 }
 
-void PresentManager::CopyToSwapchainImpl(Frame* frame) {
+bool PresentManager::CopyToSwapchainImpl(Frame* frame) {
 
     // Recreate for size changes, SDR/HDR10/scRGB transitions, or a suboptimal swapchain.
     const bool is_suboptimal = swapchain.NeedsRecreation() || swapchain.IsOutDated();
@@ -604,7 +627,7 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     const bool color_space_changed = swapchain.GetRequestedColorSpace() != frame->color_space;
     if (is_suboptimal || size_changed || format_changed || color_space_changed) {
         if (!RecreateSwapchain(frame)) {
-            return;
+            return false;
         }
     } else if (frame->color_space == VK_COLOR_SPACE_HDR10_ST2084_EXT &&
                Common::DisplayHdrMonitor::Instance().Generation() != hdr_metadata_generation) {
@@ -618,16 +641,16 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     }
     if (transfer_mode == TransferMode::Unsupported) {
         DiscardFrame(frame);
-        return;
+        return false;
     }
     if (!swapchain.IsCreated()) {
         DiscardFrame(frame);
-        return;
+        return false;
     }
 
     while (swapchain.AcquireNextImage(!use_present_thread, frame->game_frame_presents)) {
         if (!RecreateSwapchain(frame)) {
-            return;
+            return false;
         }
     }
 
@@ -786,12 +809,13 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
         });
     }
 #endif
-    swapchain.Present(render_semaphore);
+    const bool succeeded = swapchain.Present(render_semaphore);
 #ifdef EGLANTINE_STREAMLINE
     if (frame->frame_gen) {
         Streamline::FrameGenAfterPresent(frame->frame_gen_frame.index);
     }
 #endif
+    return succeeded;
 }
 
 } // namespace Vulkan
