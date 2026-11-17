@@ -36,9 +36,16 @@ public:
 
     void Process(const Device& device, Scheduler& scheduler, VkImage current_frame,
                  VkImageView current_view, u64 frame_count);
+    void ResetHistory();
 
     void Generate(const Device& device, Scheduler& scheduler, VkImage destination,
                   VkImageView destination_storage_view, float blend_factor, float flow_scale);
+
+    [[nodiscard]] std::vector<u8> ReadMotionVectors(Scheduler& scheduler);
+
+    [[nodiscard]] VkExtent2D MotionExtent() const {
+        return m_flow_extent;
+    }
 
     [[nodiscard]] bool IsReady() const {
         return m_initialized && m_has_history && m_flow_valid;

@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstring>
+#include <limits>
+#include <numbers>
 #include <string>
 #include <vector>
 
@@ -33,6 +37,9 @@ constexpr u32 LSFG_RECURRENCE_FRAMES = 2;
 constexpr auto ACTIVITY_LOG_INTERVAL = std::chrono::seconds(10);
 
 [[nodiscard]] std::string ModeText(Settings::FrameGenType active) {
+    if (active == Settings::FrameGenType::XeFG) {
+        return "XeFG optical flow 2x";
+    }
     const char* type = active == Settings::FrameGenType::Fsr3 ? "FSR3" : "LSFG";
     const u32 target_rate = Settings::values.frame_gen_target_rate.GetValue();
     if (target_rate != 0) {
@@ -104,6 +111,46 @@ constexpr auto ACTIVITY_LOG_INTERVAL = std::chrono::seconds(10);
 
 bool IsBlueFirst(VkFormat format) {
     return format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB;
+}
+
+f32 HalfToFloat(u16 value) {
+    const f32 sign = (value & 0x8000) != 0 ? -1.0f : 1.0f;
+    const u32 exponent = (value >> 10) & 0x1f;
+    const u32 mantissa = value & 0x3ff;
+    if (exponent == 0) {
+        return sign * std::ldexp(static_cast<f32>(mantissa), -24);
+    }
+    if (exponent == 0x1f) {
+        return mantissa == 0 ? sign * std::numeric_limits<f32>::infinity()
+                             : std::numeric_limits<f32>::quiet_NaN();
+    }
+    return sign * std::ldexp(1.0f + static_cast<f32>(mantissa) / 1024.0f,
+                             static_cast<s32>(exponent) - 15);
+}
+
+std::array<u8, 3> MotionColor(f32 x, f32 y) {
+    const f32 magnitude = std::hypot(x, y);
+    if (!std::isfinite(magnitude) || magnitude < 0.05f) {
+        return {};
+    }
+    const f32 hue = (std::atan2(y, x) + std::numbers::pi_v<f32>) /
+                    (2.0f * std::numbers::pi_v<f32>);
+    const f32 sector = hue * 6.0f;
+    const f32 chroma = std::clamp(magnitude / 3.0f, 0.0f, 1.0f);
+    const f32 intermediate = chroma * (1.0f - std::abs(std::fmod(sector, 2.0f) - 1.0f));
+    f32 red{};
+    f32 green{};
+    f32 blue{};
+    switch (static_cast<u32>(sector) % 6) {
+    case 0: red = chroma; green = intermediate; break;
+    case 1: red = intermediate; green = chroma; break;
+    case 2: green = chroma; blue = intermediate; break;
+    case 3: green = intermediate; blue = chroma; break;
+    case 4: red = intermediate; blue = chroma; break;
+    default: red = chroma; blue = intermediate; break;
+    }
+    return {static_cast<u8>(red * 255.0f), static_cast<u8>(green * 255.0f),
+            static_cast<u8>(blue * 255.0f)};
 }
 
 VkDeviceSize BytesPerTexel(VkFormat format) {
@@ -292,6 +339,21 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
         warm_streak = 0;
         return;
     }
+
+    if (type == Settings::FrameGenType::XeFG) {
+        const auto now = std::chrono::steady_clock::now();
+        if (last_frame_time && now - *last_frame_time > std::chrono::milliseconds{250}) {
+            if (fsr3_chain) {
+                fsr3_chain->ResetHistory();
+            }
+            warm_streak = 0;
+            generated = false;
+            LOG_INFO(Render_Vulkan, "[XeFG] Optical-flow history reset after a frame gap");
+        }
+        last_frame_time = now;
+    } else {
+        last_frame_time.reset();
+    }
     SetState(VideoCore::FrameGenState::Running, format);
 
     peak_guest_extent.width = (std::max)(peak_guest_extent.width, guest_extent.width);
@@ -315,7 +377,27 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
     generated_frames.fetch_add(GeneratedFrameCount(), std::memory_order_relaxed);
     LogActivity();
 
-    const bool use_fsr3 = type == Settings::FrameGenType::Fsr3;
+    const bool use_fsr3 = type == Settings::FrameGenType::Fsr3 ||
+                          type == Settings::FrameGenType::XeFG;
+
+    if (type == Settings::FrameGenType::XeFG && !xefg_reported) {
+        const bool matrix_candidate = device.IsCooperativeHmmaSupported() ||
+                                      device.IsCooperativeHmma16x16x16Supported();
+        const auto matrix_shapes = device.GetPhysical().GetCooperativeMatrixPropertiesKHR();
+        LOG_INFO(Render_Vulkan,
+                 "[XeFG] Vulkan optical-flow interpolation active at 2x; cooperative-matrix "
+                 "candidate={}, reported shapes={}, XMX inference backend unavailable",
+                 matrix_candidate, matrix_shapes.size());
+        for (const auto& shape : matrix_shapes) {
+            LOG_INFO(Render_Vulkan,
+                     "[XeFG] Cooperative-matrix shape {}x{}x{}, component types {}/{}/{}/{}, "
+                     "scope {}",
+                     shape.MSize, shape.NSize, shape.KSize, static_cast<u32>(shape.AType),
+                     static_cast<u32>(shape.BType), static_cast<u32>(shape.CType),
+                     static_cast<u32>(shape.ResultType), static_cast<u32>(shape.scope));
+        }
+        xefg_reported = true;
+    }
 
     if (use_fsr3 && fsr3_chain) {
         scheduler.RequestOutsideRenderPassOperationContext();
@@ -330,13 +412,18 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
             }
         });
 
-        const bool dump_requested = generated && Settings::values.frame_gen_dump_flow.GetValue();
-        if (!dump_requested) {
-            dumped = false;
-        } else if (!dumped) {
+    }
+
+    const bool dump_requested = generated && Settings::values.frame_gen_dump_flow.GetValue();
+    if (!dump_requested) {
+        dumped = false;
+    } else if (!dumped) {
+        if (type == Settings::FrameGenType::XeFG && fsr3_chain) {
+            DumpXeFGMotionVectors(count);
+        } else if (chain) {
             DumpDebugImages(count);
-            dumped = true;
         }
+        dumped = true;
     }
 }
 
@@ -431,6 +518,9 @@ size_t FrameGen::WantedGenerations(size_t capacity, size_t free_frames,
     }
     plan = pacer.Plan(capacity, blocked);
     plan.generations = GenerationsWithoutWaiting(plan.generations, free_frames);
+    if (Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::XeFG) {
+        plan.generations = std::min<size_t>(plan.generations, 1);
+    }
     return plan.generations;
 }
 
@@ -439,7 +529,8 @@ size_t FrameGen::GeneratedFrameCount() const {
 }
 
 void FrameGen::GenerateInto(const Device& device, Frame* destination, size_t generation) {
-    const bool use_fsr3 = built_type == Settings::FrameGenType::Fsr3;
+    const bool use_fsr3 = built_type == Settings::FrameGenType::Fsr3 ||
+                          built_type == Settings::FrameGenType::XeFG;
 
     if (use_fsr3 && fsr3_chain) {
         const f32 blend = static_cast<f32>(generation + 1) / static_cast<f32>(last_generations + 1);
@@ -473,7 +564,8 @@ void FrameGen::Rebuild(const Device& device, VkExtent2D extent, VkFormat format,
     built_flow_scale = flow_scale;
     built_type = type;
 
-    if (built_type == Settings::FrameGenType::Fsr3) {
+    if (built_type == Settings::FrameGenType::Fsr3 ||
+        built_type == Settings::FrameGenType::XeFG) {
         fsr3_chain.emplace(device, memory_allocator, extent, format);
     } else {
         chain.emplace(device, memory_allocator, *shaders, extent, format, built_flow_scale);
@@ -543,6 +635,32 @@ void FrameGen::DumpDebugImages(u64 count) {
     dump("gamma6", chain->GammaOutput(LSFG_MIP_LEVELS - 1));
     dump("delta2_out1", chain->DeltaOutput1(LSFG_DELTA_INSTANCES - 1));
     dump("delta2_out2", chain->DeltaOutput2(LSFG_DELTA_INSTANCES - 1));
+}
+
+void FrameGen::DumpXeFGMotionVectors(u64 count) {
+    const std::filesystem::path directory =
+        Common::FS::GetEdenPath(Common::FS::EdenPath::LosslessDir) / "debug";
+    if (!Common::FS::CreateDirs(directory)) {
+        return;
+    }
+    const VkExtent2D extent = fsr3_chain->MotionExtent();
+    const std::vector<u8> data = fsr3_chain->ReadMotionVectors(scheduler);
+    const size_t pixel_count = static_cast<size_t>(extent.width) * extent.height;
+    if (data.size() < pixel_count * sizeof(u16) * 2) {
+        return;
+    }
+    std::vector<u8> rgb(pixel_count * 3);
+    for (size_t pixel = 0; pixel < pixel_count; ++pixel) {
+        u16 x_bits{};
+        u16 y_bits{};
+        std::memcpy(&x_bits, data.data() + pixel * 4, sizeof(x_bits));
+        std::memcpy(&y_bits, data.data() + pixel * 4 + sizeof(x_bits), sizeof(y_bits));
+        const auto color = MotionColor(HalfToFloat(x_bits), HalfToFloat(y_bits));
+        std::copy(color.begin(), color.end(), rgb.begin() + static_cast<std::ptrdiff_t>(pixel * 3));
+    }
+    const std::filesystem::path path = directory / fmt::format("xefg_motion_{}.ppm", count);
+    WritePortablePixmap(path, "P6", extent, rgb);
+    LOG_INFO(Render_Vulkan, "[XeFG] Wrote motion-vector visualization {}", path.string());
 }
 
 } // namespace Vulkan

@@ -196,7 +196,19 @@ void Fsr3FrameGen::CreateResources(const Device& device) {
     m_current_view = CreateWrappedImageView(device, m_current_image, m_format);
 
     // Half-resolution motion vector image
-    m_motion_image = CreateWrappedImage(m_allocator, m_flow_extent, VK_FORMAT_R16G16_SFLOAT);
+    m_motion_image = m_allocator.CreateImage(VkImageCreateInfo{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = VK_FORMAT_R16G16_SFLOAT,
+        .extent = {m_flow_extent.width, m_flow_extent.height, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                 VK_IMAGE_USAGE_SAMPLED_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    });
     m_motion_view = CreateWrappedImageView(device, m_motion_image, VK_FORMAT_R16G16_SFLOAT);
 
     const std::array pool_sizes{
@@ -381,6 +393,11 @@ void Fsr3FrameGen::Process(const Device& device, Scheduler& scheduler, VkImage c
     m_flow_valid = true;
 }
 
+void Fsr3FrameGen::ResetHistory() {
+    m_has_history = false;
+    m_flow_valid = false;
+}
+
 void Fsr3FrameGen::Generate(const Device& device, Scheduler& scheduler, VkImage destination,
                             VkImageView destination_storage_view, float blend_factor,
                             float flow_scale) {
@@ -437,6 +454,28 @@ void Fsr3FrameGen::Generate(const Device& device, Scheduler& scheduler, VkImage 
         cmdbuf.PushConstants(*m_interp_pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, constants);
         cmdbuf.Dispatch((out_w + 15) / 16, (out_h + 15) / 16, 1);
     });
+}
+
+std::vector<u8> Fsr3FrameGen::ReadMotionVectors(Scheduler& scheduler) {
+    if (!m_flow_valid) {
+        return {};
+    }
+    const VkDeviceSize size = static_cast<VkDeviceSize>(m_flow_extent.width) *
+                              m_flow_extent.height * sizeof(u16) * 2;
+    vk::Buffer buffer = CreateWrappedBuffer(m_allocator, size, MemoryUsage::Download);
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record([image = *m_motion_image, destination = *buffer, extent = m_flow_extent](
+                         vk::CommandBuffer cmdbuf) {
+        DownloadColorImage(cmdbuf, image, destination,
+                           VkExtent3D{extent.width, extent.height, 1});
+    });
+    scheduler.Finish();
+    buffer.Invalidate();
+    const std::span<u8> mapped = buffer.Mapped();
+    if (mapped.size() < size) {
+        return {};
+    }
+    return {mapped.begin(), mapped.begin() + static_cast<std::ptrdiff_t>(size)};
 }
 
 } // namespace Vulkan

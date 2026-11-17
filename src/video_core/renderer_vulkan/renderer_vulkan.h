@@ -21,6 +21,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
+#include "video_core/renderer_vulkan/xefg_vk_capture.h"
 #include "video_core/renderer_vulkan/vk_turbo_mode.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
@@ -143,6 +144,7 @@ private:
     BlitScreen blit_capture;
     BlitScreen blit_applet;
     RasterizerVulkan rasterizer;
+    XeFGVKCapture xefg_capture;
 #ifdef HAS_LSFG
     FrameGen frame_gen;
 #endif

@@ -56,6 +56,7 @@ private:
     /// Logs every 10 s how many frames were generated, when that changes.
     void LogActivity();
     void DumpDebugImages(u64 count);
+    void DumpXeFGMotionVectors(u64 count);
 
     MemoryAllocator& memory_allocator;
     Scheduler& scheduler;
@@ -72,11 +73,13 @@ private:
     f32 built_flow_scale{};
     u64 frame_count{};
     u64 last_count{};
+    std::optional<std::chrono::steady_clock::time_point> last_frame_time;
     size_t last_generations{};
     u32 warm_streak{};
     bool generated{};
     bool unavailable{};
     bool dumped{};
+    bool xefg_reported{};
     std::atomic<VideoCore::FrameGenState> state{VideoCore::FrameGenState::Pending};
     std::atomic<u64> generated_frames{};
     struct {
